@@ -10,7 +10,7 @@ Key differences from the original:
   - Graceful degradation: evolution failure -> memory stored without evolution
 """
 
-from typing import List, Dict, Optional, Literal, Any
+from typing import List, Dict, Optional, Literal, Any, Tuple
 import json
 import re
 import uuid
@@ -18,6 +18,7 @@ import os
 import time
 import logging
 import functools
+from collections import defaultdict
 from datetime import datetime
 from abc import ABC, abstractmethod
 
@@ -36,6 +37,31 @@ from llm_text_parsers import (
 )
 
 logger = logging.getLogger("amem_robust")
+
+TRACE_EVENT_FILTER_PROMPT = """You are a narrative coherence analyzer.
+Event Chain A is an existing chain and Event List B are new events.
+Return strict JSON with keys: related_events, unrelated_events.
+
+Event Chain A:
+{content_a}
+
+Event List B:
+{content_b}
+"""
+
+TRACE_INIT_PROMPT = """You are an event chain constructor.
+Given events, return strict JSON with keys: primary_chain, secondary_chains, isolated_events.
+
+Events:
+{events}
+"""
+
+EVENT_EXTRACT_PROMPT = """Extract structured metadata for memory construction.
+Return strict JSON with keys: topic, explicit_mentions.
+
+Content:
+{text}
+"""
 
 # ---------------------------------------------------------------------------
 # Retry decorator
@@ -286,6 +312,8 @@ class RobustMemoryNote:
                  evolution_history: Optional[List] = None,
                  category: Optional[str] = None,
                  tags: Optional[List[str]] = None,
+                 topic: Optional[str] = None,
+                 events: Optional[List[str]] = None,
                  llm_controller: Optional[RobustLLMController] = None):
 
         self.content = content
@@ -313,6 +341,9 @@ class RobustMemoryNote:
         self.evolution_history = evolution_history or []
         self.category = category or "Uncategorized"
         self.tags = tags or []
+        self.topic = topic or ""
+        self.events = events or []
+        self.events_text = " | ".join(self.events)
 
     @staticmethod
     def build_scene_content(turns: List[str], scene_title: Optional[str] = None) -> str:
@@ -376,7 +407,8 @@ class RobustAgenticMemorySystem:
                  api_base: Optional[str] = None,
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000,
-                 check_connection: bool = False):
+                 check_connection: bool = False,
+                 trace_similarity_threshold: float = 0.5):
 
         self.memories: Dict[str, RobustMemoryNote] = {}
         self.retriever = SimpleEmbeddingRetriever(model_name)
@@ -386,6 +418,10 @@ class RobustAgenticMemorySystem:
         )
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold
+        # Membox-like global topic consistency structure
+        self.trace_similarity_threshold = trace_similarity_threshold
+        self.traces: List[Dict[str, Any]] = []
+        self.trace_note_map: Dict[str, List[int]] = defaultdict(list)
 
     # ---- public API (mirrors AgenticMemorySystem) ----
 
@@ -406,19 +442,158 @@ class RobustAgenticMemorySystem:
             timestamp=time,
             **kwargs,
         )
+        note.topic, note.events = self._extract_topic_events(note.content)
+        note.events_text = " | ".join(note.events)
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
         self.retriever.add_documents([
             "content:" + note.content +
             " context:" + note.context +
             " keywords: " + ", ".join(note.keywords) +
-            " tags: " + ", ".join(note.tags)
+            " tags: " + ", ".join(note.tags) +
+            " topic: " + note.topic +
+            " events: " + note.events_text
         ])
+        self._update_traces_with_note(note)
         if evo_label:
             self.evo_cnt += 1
             if self.evo_cnt % self.evo_threshold == 0:
                 self.consolidate_memories()
         return note.id
+
+    def _extract_topic_events(self, content: str) -> Tuple[str, List[str]]:
+        """Extract topic and explicit events for trace linking."""
+        try:
+            prompt = EVENT_EXTRACT_PROMPT.format(text=content)
+            response = self.llm_controller.llm.get_completion(prompt, temperature=0.0)
+            parsed = json.loads(response)
+            topic = str(parsed.get("topic", "")).strip()
+            events = parsed.get("explicit_mentions", [])
+            if not isinstance(events, list):
+                events = []
+            events = [str(e).strip() for e in events if str(e).strip()]
+            if not topic:
+                topic = " ".join(content.split()[:12]).strip()
+            return topic, events
+        except Exception:
+            # fallback: no extra LLM dependency for robustness
+            topic = " ".join(content.split()[:12]).strip()
+            return topic, []
+
+    def _event_similarity(self, event_a: str, event_b: str) -> float:
+        try:
+            emb = self.retriever.model.encode([event_a, event_b])
+            sim = cosine_similarity([emb[0]], [emb[1]])[0][0]
+            return float(sim)
+        except Exception:
+            return 0.0
+
+    def _trace_event_lines(self, trace: Dict[str, Any]) -> List[str]:
+        lines: List[str] = []
+        for entry in trace.get("entries", []):
+            ts = str(entry.get("start_time", "Unknown"))
+            for ev in entry.get("events", []):
+                if ev:
+                    lines.append(f"{ts}: {ev}")
+        return lines
+
+    def _llm_event_filter(self, trace: Dict[str, Any], events: List[str]) -> Tuple[set, set]:
+        chain_text = "\n".join(self._trace_event_lines(trace)) or "None"
+        events_text = "\n".join(events) or "None"
+        prompt = TRACE_EVENT_FILTER_PROMPT.format(content_a=chain_text, content_b=events_text)
+        try:
+            res = self.llm_controller.llm.get_completion(prompt, temperature=0.0)
+            d = json.loads(res)
+            related = set([str(e).strip() for e in (d.get("related_events") or []) if str(e).strip()])
+            unrelated = set([str(e).strip() for e in (d.get("unrelated_events") or []) if str(e).strip()])
+            if not related and not unrelated:
+                return set(events), set()
+            return related, unrelated
+        except Exception:
+            return set(events), set()
+
+    def _llm_init_chain(self, events: List[str]) -> Dict[str, Any]:
+        prompt = TRACE_INIT_PROMPT.format(events="\n".join(events))
+        try:
+            res = self.llm_controller.llm.get_completion(prompt, temperature=0.0)
+            return json.loads(res)
+        except Exception:
+            return {"primary_chain": events, "secondary_chains": [], "isolated_events": []}
+
+    def _append_trace(self, note: RobustMemoryNote, events: List[str]):
+        events_clean = [e for e in events if e]
+        if not events_clean:
+            return
+        trace_id = len(self.traces)
+        trace = {
+            "trace_id": trace_id,
+            "note_ids": [note.id],
+            "entries": [{"note_id": note.id, "start_time": note.timestamp, "events": events_clean}],
+        }
+        self.traces.append(trace)
+        self.trace_note_map[note.id].append(trace_id)
+
+    def _update_traces_with_note(self, note: RobustMemoryNote):
+        """Membox-like two-stage trace update: similarity candidates + LLM filter."""
+        events = [e for e in (note.events or []) if e]
+        if not events:
+            return
+
+        selected_trace_ids = set()
+        for ev in events:
+            best_trace_id = None
+            best_score = -1.0
+            for tr in self.traces:
+                trace_best = -1.0
+                for entry in tr.get("entries", []):
+                    for tev in entry.get("events", []):
+                        score = self._event_similarity(ev, tev)
+                        if score > trace_best:
+                            trace_best = score
+                if trace_best > best_score:
+                    best_score = trace_best
+                    best_trace_id = tr["trace_id"]
+            if best_trace_id is not None and best_score >= self.trace_similarity_threshold:
+                selected_trace_ids.add(best_trace_id)
+
+        matched_events = set()
+        trace_lookup = {t["trace_id"]: t for t in self.traces}
+        for tr_id in selected_trace_ids:
+            tr = trace_lookup.get(tr_id)
+            if not tr:
+                continue
+            related, _ = self._llm_event_filter(tr, events)
+            if related:
+                tr["entries"].append({"note_id": note.id, "start_time": note.timestamp, "events": list(related)})
+                if note.id not in tr["note_ids"]:
+                    tr["note_ids"].append(note.id)
+                matched_events.update(related)
+                self.trace_note_map[note.id].append(tr_id)
+
+        unmatched = [e for e in events if e not in matched_events]
+        if not unmatched:
+            return
+
+        if len(unmatched) == 1:
+            self._append_trace(note, unmatched)
+            return
+
+        init_res = self._llm_init_chain(unmatched)
+        chains = []
+        primary = init_res.get("primary_chain") or []
+        secondary = init_res.get("secondary_chains") or []
+        isolated = init_res.get("isolated_events") or []
+        if primary:
+            chains.append(primary)
+        for ch in secondary:
+            if ch:
+                chains.append(ch)
+        if not chains and isolated:
+            chains.append(isolated)
+        if not chains:
+            chains = [unmatched]
+        for ch in chains:
+            self._append_trace(note, [str(e).strip() for e in ch if str(e).strip()])
 
     def consolidate_memories(self):
         """Re-initialize the retriever with current memory state."""
@@ -429,7 +604,10 @@ class RobustAgenticMemorySystem:
 
         self.retriever = SimpleEmbeddingRetriever(model_name)
         for memory in self.memories.values():
-            metadata_text = f"{memory.context} {' '.join(memory.keywords)} {' '.join(memory.tags)}"
+            metadata_text = (
+                f"{memory.context} {' '.join(memory.keywords)} {' '.join(memory.tags)} "
+                f"{getattr(memory, 'topic', '')} {getattr(memory, 'events_text', '')}"
+            )
             self.retriever.add_documents([memory.content + " , " + metadata_text])
 
     def find_related_memories(self, query: str, k: int = 5) -> tuple:
@@ -439,6 +617,7 @@ class RobustAgenticMemorySystem:
 
         indices = self.retriever.search(query, k)
         all_memories = list(self.memories.values())
+        all_memory_ids = list(self.memories.keys())
         memory_str = ""
         for i in indices:
             memory_str += (
@@ -458,16 +637,41 @@ class RobustAgenticMemorySystem:
 
         indices = self.retriever.search(query, k)
         all_memories = list(self.memories.values())
+        all_memory_ids = list(self.memories.keys())
         memory_str = ""
+        seen_trace_note_ids = set()
         for i in indices:
             j = 0
+            note_id = all_memory_ids[i]
             memory_str += (
                 "talk start time:" + all_memories[i].timestamp +
                 "memory content: " + all_memories[i].content +
                 "memory context: " + all_memories[i].context +
                 "memory keywords: " + str(all_memories[i].keywords) +
-                "memory tags: " + str(all_memories[i].tags) + "\n"
+                "memory tags: " + str(all_memories[i].tags) +
+                "memory topic: " + str(all_memories[i].topic) +
+                "memory events: " + str(all_memories[i].events) + "\n"
             )
+            # global topic consistency: include trace neighbors
+            for tr_id in self.trace_note_map.get(note_id, []):
+                if tr_id >= len(self.traces):
+                    continue
+                trace = self.traces[tr_id]
+                for trace_note_id in trace.get("note_ids", []):
+                    if (
+                        trace_note_id == note_id
+                        or trace_note_id not in self.memories
+                        or trace_note_id in seen_trace_note_ids
+                    ):
+                        continue
+                    seen_trace_note_ids.add(trace_note_id)
+                    tnote = self.memories[trace_note_id]
+                    memory_str += (
+                        "[trace-related] talk start time:" + tnote.timestamp +
+                        "memory content: " + tnote.content +
+                        "memory topic: " + str(tnote.topic) +
+                        "memory events: " + str(tnote.events) + "\n"
+                    )
             neighborhood = all_memories[i].links
             for neighbor in neighborhood:
                 memory_str += (

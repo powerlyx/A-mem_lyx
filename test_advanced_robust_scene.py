@@ -25,9 +25,10 @@ import nltk
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import pytorch_cos_sim
 import statistics
-from collections import defaultdict
+from collections import defaultdict, Counter
 import pickle
 import random
+import re
 from tqdm import tqdm
 from utils import calculate_metrics, aggregate_metrics
 from datetime import datetime
@@ -48,6 +49,54 @@ except Exception as e:
     sentence_model = None
 
 logger = logging.getLogger("amem_robust")
+
+
+TOPIC_SHIFT_MARKERS = [
+    "by the way", "anyway", "on another note", "btw",
+    "speaking of", "as for", "back to", "in other news"
+]
+
+NOISE_WORDS = {
+    "speaker", "says", "session", "turn", "date", "time",
+    "yes", "yeah", "okay", "ok", "hmm", "uh", "um",
+    "thanks", "awesome", "great", "really"
+}
+
+
+def build_semantic_scene_title(scene_turns: List[str]) -> str:
+    """Build a lightweight semantic title from scene turns (no extra LLM call)."""
+    text = " ".join(scene_turns).lower()
+    tokens = re.findall(r"\b[a-zA-Z]{3,}\b", text)
+    tokens = [t for t in tokens if t not in NOISE_WORDS]
+    if not tokens:
+        return "General conversation"
+    top = [w for w, _ in Counter(tokens).most_common(3)]
+    return "Topic: " + ", ".join(top)
+
+
+def should_start_new_scene(current_scene_turns: List[str],
+                           new_turn: str,
+                           threshold: float = 0.38) -> bool:
+    """Decide scene boundary by marker hit OR semantic similarity threshold."""
+    if not current_scene_turns:
+        return False
+
+    text_lower = new_turn.lower()
+    if any(marker in text_lower for marker in TOPIC_SHIFT_MARKERS):
+        return True
+
+    if sentence_model is None:
+        return False
+
+    scene_text = " ".join(current_scene_turns)
+    try:
+        emb_scene = sentence_model.encode([scene_text])[0]
+        emb_new = sentence_model.encode([new_turn])[0]
+        sim = float(np.dot(emb_scene, emb_new) / ((np.linalg.norm(emb_scene) * np.linalg.norm(emb_new)) + 1e-8))
+        return sim < threshold
+    except Exception as e:
+        logger.debug("Scene boundary fallback due to embedding error: %s", e)
+        return False
 
 
 class RobustAdvancedMemAgent:
@@ -241,16 +290,32 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         else:
             eval_logger.info(f"No cached memories found for sample {sample_idx}. Creating new memories.")
 
-            scene_window = 3
+            max_scene_turns = 6
+            scene_similarity_threshold = 0.38
             for session_id, turns in sample.conversation.sessions.items():
                 turn_datetime = turns.date_time
-                history = []
+                current_scene = []
+
                 for turn in turns.turns:
-                    conversation_tmp = "Speaker " + turn.speaker + " says: " + turn.text
-                    history.append(conversation_tmp)
-                    scene_turns = history[-scene_window:]
-                    scene_title = f"session_{session_id}_last_{len(scene_turns)}_turns"
-                    agent.add_scene_memory(scene_turns, time=turn_datetime, scene_title=scene_title)
+                    new_turn = "Speaker " + turn.speaker + " says: " + turn.text
+
+                    if current_scene and should_start_new_scene(
+                        current_scene, new_turn, threshold=scene_similarity_threshold
+                    ):
+                        scene_title = build_semantic_scene_title(current_scene)
+                        agent.add_scene_memory(current_scene, time=turn_datetime, scene_title=scene_title)
+                        current_scene = [new_turn]
+                    else:
+                        current_scene.append(new_turn)
+
+                    if len(current_scene) >= max_scene_turns:
+                        scene_title = build_semantic_scene_title(current_scene)
+                        agent.add_scene_memory(current_scene, time=turn_datetime, scene_title=scene_title)
+                        current_scene = []
+
+                if current_scene:
+                    scene_title = build_semantic_scene_title(current_scene)
+                    agent.add_scene_memory(current_scene, time=turn_datetime, scene_title=scene_title)
 
             memories_to_cache = agent.memory_system.memories
             with open(memory_cache_file, 'wb') as f:
